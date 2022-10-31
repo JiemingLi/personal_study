@@ -821,6 +821,316 @@ aeProcessEvents 都会先 **计算最近的时间事件发生所需要等待的�
 
 3， 集群分区，客户端分区（中心化），proxy分区（中心化），官方cluster分区（去中心化）
 
+## 主从复制
+
+主要存储数据的节点叫做主节点 (master），把其他通过复制主节点数据的副本节点叫做从节点 (slave），在 Redis 中一个主节点可以拥有多个从节点，一个从节点也可以是其他服务器的主节点
+
+![主从同步-从从模式.png](https://gitee.com/JieMingLi/document-pics/raw/master/369eda70-800a-11ea-b751-6ff511beda88.png)
+
+### **作用**
+
+1， 一主多从，主从同步。
+
+2， 主负责写，从负责读，提升Redis的性能和吞吐量。
+
+3， 利用哨兵可以实现主从切换，做到高可用
+
+### 实现
+
+**Redis 2.8以前**
+
+Redis的同步功能分为同步(sync)和命令传播(command propagate)。
+
+**同步操作:**
+
+1. 通过从服务器发送到SYNC命令给主服务器
+2. 服务器生成RDB文件并发送给从服务器，同时发送保存所有写命令给从服务器
+3. 从服务器清空之前数据并执行解释RDB文件
+4. 保持数据一致(还需要命令传播过程才能保持一致)
+
+命令传播：同步操作完成后，主服务器执行写命令，该命令发送给从服务器并执行，使主从保存一致。
+
+缺点：
+
+1， 没有全量同步和增量同步的概念，从服务器在同步时，会清空所有数据。
+
+2， 主从服务器断线后重复制，主服务器会重新生成RDB文件和重新记录缓冲区的所有命令，并全量同步到从服务器上，增加带宽成本。
+
+**Redis 2.8以后**
+
+服务器 runId ：无论主库还是从库都有自己的 RUN ID，RUN ID 启动时自动产生，RUN ID 由40个随机的十六进
+
+> 1. 当从库对主库初次复制时，主库将自身的 RUN ID 传送给从库，从库会将 RUN ID 保存；
+> 2. 当从库断线重连主库时，从库将向主库发送之前保存的 RUN ID；
+>    - 从库 RUN ID 和主库 RUN ID 一致，说明从库断线前复制的就是当前的主库；主库尝试执行 增量同步操作；
+>    - 若不一致，说明从库断线前复制的主库并不时当前的主库，则主库将对从库执行全量同步操作；
+
+ 复制偏移量 offset：主从都会维护一个复制偏移量；
+
+- 主库向从库发送N个字节的数据时，将自己的复制偏移量上加N；
+- 从库接收到主库发送的N个字节数据时，将自己的复制偏移量加上N；
+
+> 通过比较主从偏移量得知主从之间数据是否一致；偏移量相同则数据一致；偏移量不同则数据不一
+
+使用PSYNC命令，具备完整重同步和部分重同步模式。
+
+- Redis 的主从同步，分为**全量同步**和**增量同步**。
+- 只有从机第一次连接上主机是**全量同步**。
+- 断线重连有可能触发**全量同步**也有可能是**增量同步**( master 判断 runid 是否一致，主要是为了让新的slave都可以进行同步数据)。![在这里插入图片描述](https://gitee.com/JieMingLi/document-pics/raw/master/b89341cfdb414723891504a2fb4c571d.png)
+
+**Redis的全量同步过程主要分三个阶段:**
+
+- **同步快照阶段**：Master 创建并发送**快照**RDB给 Slave ， Slave 载入并解析快照。 Master 同时将  此阶段所产生的新的写命令存储到缓冲区。
+- **同步写缓冲阶段**： Master 向 Slave 同步存储在缓冲区的写操作命令。
+- **同步增量阶段:**  Master 向 Slave 同步写操作命令。![image-20221101013034023](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221101013034023.png)
+
+**增量同步**
+
+- Redis增量同步主要指Slave完成初始化后开始正常工作时， Master 发生的写操作同步到 Slave 的 过程，通常情况下， Master 每执行一个写命令就会向 Slave 发送相同的**写命令**，然后 Slave 接收并执 行。
+- 如果全量复制过程中，master-slave 网络连接断掉，那么 slave 重新连接 master 时，可能会触发增量同步。
+
+**增量同步的场景：**
+
+1. 主从第一次连接成功，并且进行完全量同步之后，主服务器接收到一条命令就传一条命令给从服务器。
+2. 在全量同步的过程中发生断网，并且重新连接网络的时候，会进行增量同步，但是有可能为全量同步，取决于主服务的复制积压缓冲区有没有填满。
+   1. 从服务器中途断开，比如 突然断电等，连接上以后，这个时候就可以尝试增量同步，如果可以增量，那么就不用动用全量这个重型操作，在主从服务器建立连接后，他们之间都维护长连接并彼此发送心跳命令，其实主从服务器彼此都有心跳机制，各自模拟成对方的客户端进行通信，从服务每个 1秒 发送 `REPLCONF ACK <offset>` 信息，像主服务器报告当前复制偏移量。
+   2. 在主服务器有一个复制积压缓冲区（1M大的循环队列），因为主服务器在命令传播时，不仅会将命令发送给所有的从服务器，还会将命令写入 复制积压缓冲区中，复制积压缓冲区 最多可以备份1M大小的数据，如果主从服务器断线时间过长，复制积压缓冲区 的数据会被新数据覆盖（大于1M），那么当从主从中断连接起，此时从服务器无法增量同步，只能全量同步。
+
+[全量同步和增量同步的区别](https://blog.csdn.net/qq_21539375/article/details/124719577)
+
+**心跳检测的作用**
+
+在命令传播阶段，从服务器默认会以每秒1次的频率向主服务器发送命令，有以下的作用：
+
+1. 检测主从服务器的网络连接状态
+
+2. 检测命令丢失，补发数据
+   1. 主从已经连接后，主服务器传播给从服务器的写命令在半路丢失（网络故障），那么当从服务器向主服务器发 送REPLCONF ACK命令时，主服务器将发觉从服务器当前的复制偏移量少于自己的复制偏移量， 然后主服务器就会根据从服务器提交的复制偏移量，在复制积压缓冲区里面找到从服务器缺少的数 据，并将这些数据重新发送给从服务器。
+   2. 在主从全量复制过程中，断网后再连接触发的增量同步。
+
+### 原理
+
+> Redis 源码中采用的基于**状态机**跳转的设计思路和主从复制的实现。
+
+每一个 Redis 实例在代码中都对应一个 **redisServer 结构体**，这个结构体包含了和 Redis 实例相关的各种配置，比如实例的 RDB、AOF 配置、主从复制配置、切片集群配置等。与主从复制状态机相关的变量是 **repl_state**，Redis 在进行主从复制时，从库就是根据这个变量值的变化，来实现不同阶段的执行和跳转。
+
+```c
+struct redisServer {
+   ...
+   /* 复制相关(slave) */
+    char *masterauth;               /* 用于和主库进行验证的密码*/
+    char *masterhost;               /* 主库主机名 */
+    int masterport;                 /* 主库端口号r */
+    …
+    client *master;        /* 从库上用来和主库连接的客户端 */
+    client *cached_master; /* 从库上缓存的主库信息 */
+    int repl_state;          /* 从库的复制状态机 */
+   ...
+}
+```
+
+**初始化**
+
+redis实例启动后调用 server.c 中的 initServerConfig 函数，初始化 redisServer 结构体，此时实例会把状态机的初始状态设置为 **REPL_STATE_NONE**
+
+```c
+void initServerConfig(void) {
+   …
+   server.repl_state = REPL_STATE_NONE;
+   …
+}
+```
+
+客户端向从服务器发送slaveof(replicaof) 主机地址(127.0.0.1) 端口(6379)时:从服务器将主机 ip(127.0.0.1)和端口(6379)保存到redisServer的masterhost和masterport中，然后从服务器将向发送SLAVEOF命令的客户端返回OK，表示复制指令已经被接收，而实际上复制工作是在 OK返回之后进行。
+
+在保存完端口和ip之后，会把状态机的设置为**REPL_STATE_CONNECT**，此时代表着redis服务器主从复制的初始化阶段就完成。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/7c46c8f72f4391d29a6bcdyy8a64e6e1-20221014000136-q0a9fkf.jpg)
+
+**建立socket连接**
+
+建立连接的时机：Redis有周期事件，Redis 实例在运行时，按照一定时间周期重复执行的任务，其中周期事件中就包括 replicationCron()，默认1000ms执行一次。
+
+```c
+int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+   …
+   run_with_period(1000) replicationCron();
+   …
+}
+```
+
+replicationCron() 任务的函数实现逻辑是在 server.c 中，在replicationCron()中会检查从库的复制状态机状态。如果状态机状态是 REPL_STATE_CONNECT，那么从库就开始和主库建立连接，通过调用connectWithMaster()函数进行调用。
+
+```c
+replicationCron() {
+   …
+   /* 如果从库实例的状态是REPL_STATE_CONNECT，那么从库通过connectWithMaster和主库建立连接 */
+    if (server.repl_state == REPL_STATE_CONNECT) {
+        serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
+            server.masterhost, server.masterport);
+        if (connectWithMaster() == C_OK) { 
+            serverLog(LL_NOTICE,"MASTER <-> REPLICA sync started");
+        }
+    }
+    …
+}
+```
+
+从库实例调用 connectWithMaster 函数，在connectWithMaster 函数里会先通过 anetTcpNonBlockBestEffortBindConnect 函数和主库建立连接。连接成功后创建出客户端socket，并监听该socket的读写事件，监听后到读写事件后使用回调syncWithMaster函数。注册完之后把状态机置为 REPL_STATE_CONNECTING
+
+```c
+int connectWithMaster(void) {
+    int fd;
+    //从库和主库建立连接
+ fd = anetTcpNonBlockBestEffortBindConnect(NULL, server.masterhost,server.masterport,NET_FIRST_BIND_ADDR);
+    …
+ 
+//在建立的连接上注册读写事件，对应的回调函数是syncWithMaster
+ if(aeCreateFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE,syncWithMaster, NULL) ==AE_ERR)
+    {
+        close(fd);
+        serverLog(LL_WARNING,"Can't create readable event for SYNC");
+        return C_ERR;
+    }
+ 
+    //完成连接后，将状态机设置为REPL_STATE_CONNECTING
+    …
+    server.repl_state = REPL_STATE_CONNECTING;
+    return C_OK;
+}
+```
+
+当从库实例的状态变为 REPL_STATE_CONNECTING 时，建立连接的阶段就完成。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/dd6176abeb3ba492f15a93bd0b4a84aa-20221014000136-5oorkbx.jpg)
+
+**主动握手**
+
+当主从库建立网络连接后，从库实例其实并没有立即开始进行数据同步，而是会先和主库之间进行握手通信。
+
+握手的目的：从库和主库进行验证，以及从库将自身的 IP 和端口号发给主库。
+
+在建立完连接后，从库实例的状态处于**REPL_STATE_CONNECTING**状态，回调函数syncWithMaster判断如果状态处于**REPL_STATE_CONNECTING**则会发送PING给主库，并将状态机置为 **REPL_STATE_RECEIVE_PONG**。
+
+当从库收到主库返回的 PONG 消息后，从库会依次给主库发送验证信息、端口号、IP、对 RDB 文件和无盘复制（runId和offset）的支持情况。
+
+每次发送都对应着状态机状态的变迁，例如：当从库要给主库发送验证信息前，会将自身状态机置为 REPL_STATE_SEND_AUTH，然后，从库给主库发送实际的验证信息。验证信息发送完成后，从库状态机会变迁为 REPL_STATE_RECEIVE_AUTH，并开始读取主库返回验证结果信息。除了验证下信息，端口号，ip和rdb文件等都是很类似。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/c2946565d547bd52063ff1a79ec426cf-20221014000136-acvcy0i.jpg)
+
+**复制类型判断与执行阶段**
+
+主从完成握手后，状态机为 **REPL_STATE_RECEIVE_CAPA**，然后从库的状态变迁为 **REPL_STATE_SEND_PSYNC**，表明要开始向主库发送 PSYNC 命令，开始实际的数据同步。
+
+方式：从库会调用 slaveTryPartialResynchronization 函数，向主库发送 PSYNC 命令，并且状态机的状态会置为 **REPL_STATE_RECEIVE_PSYNC**
+
+```c
+ /* 1, 从库状态机进入REPL_STATE_RECEIVE_CAPA. */
+ if (server.repl_state == REPL_STATE_RECEIVE_CAPA) {
+  …
+  //2, 读取主库返回的CAPA消息响应，并修改状态
+       server.repl_state = REPL_STATE_SEND_PSYNC;
+  }
+  //3, 从库状态机变迁为REPL_STATE_SEND_PSYNC后，开始调用slaveTryPartialResynchronization函数向主库发送PSYNC命令，进行数据同步
+  if (server.repl_state == REPL_STATE_SEND_PSYNC) {
+    	 // 4， 调用slaveTryPartialResynchronization，发送PSYNC命令
+       if (slaveTryPartialResynchronization(fd,0) == PSYNC_WRITE_ERROR)  
+       {
+             …
+       }
+       server.repl_state = REPL_STATE_RECEIVE_PSYNC;
+          return;
+  }
+```
+
+从库调用slaveTryPartialResynchronization，向主库发送PSYNC命令，主库收到命令后，会根据从库发送的主库 ID、复制进度值 offset，来判断是进行全量复制还是增量复制，或者是返回错误。
+
+slaveTryPartialResynchronization代码如下所示
+
+```c
+int slaveTryPartialResynchronization(int fd, int read_reply) {
+   …
+   //发送PSYNC命令
+   if (!read_reply) {
+      //从库第一次和主库同步时，设置offset为-1
+  server.master_initial_offset = -1;
+  …
+  //调用sendSynchronousCommand发送PSYNC命令
+  reply =
+  sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",psync_replid,psync_offset,NULL);
+   …
+   //发送命令后，等待主库响应
+   return PSYNC_WAIT_REPLY;
+   }
+ 
+  //读取主库的响应
+  reply = sendSynchronousCommand(SYNC_CMD_READ,fd,NULL);
+ 
+ //主库返回FULLRESYNC，全量复制
+  if (!strncmp(reply,"+FULLRESYNC",11)) {
+   …
+   return PSYNC_FULLRESYNC;
+   }
+ 
+  //主库返回CONTINUE，执行增量复制
+  if (!strncmp(reply,"+ CONTINUE",11)) {
+  …
+  return PSYNC_CONTINUE;
+   }
+ 
+  //主库返回错误信息
+  if (strncmp(reply,"-ERR",4)) {
+     …
+  }
+  return PSYNC_NOT_SUPPORTED;
+}
+```
+
+第一次调用slaveTryPartialResynchronization，发送完命令之后等待主库相应（此时状态机的状态为REPL_STATE_RECEIVE_PSYNC）
+
+由于socket的读写事件都绑定了syncWithMaster函数，所以在主服务发送数据回来之后，从服务器的监听到ae_readable事件并继续回调syncWithMaster函数，根据主服务发送的结果进行不同的操作。
+
+注意⚠️：如果是全量复制的话，当主库对从库的 PSYNC 命令返回 FULLRESYNC 时，从库会在和主库的网络连接上注册 readSyncBulkPayload 回调函数，并将状态机置为 **REPL_STATE_TRANSFER**，表示开始进行实际的数据同步，比如主库把 RDB 文件传输给从库。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/f6e25eb125f0d70694d92597dca3e197-20221014000136-30ld6cc.jpg)
+
+syncWithMaster部分代码如下所示
+
+```c
+//读取PSYNC命令的返回结果
+psync_result = slaveTryPartialResynchronization(fd,1);
+//PSYNC结果还没有返回，先从syncWithMaster函数返回处理其他操作
+if (psync_result == PSYNC_WAIT_REPLY) return;
+//如果PSYNC结果是PSYNC_CONTINUE，从syncWithMaster函数返回，后续执行增量复制
+if (psync_result == PSYNC_CONTINUE) {
+       …
+       return;
+}
+ 
+//如果执行全量复制的话，针对连接上的读事件，创建readSyncBulkPayload回调函数
+if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
+            == AE_ERR)
+    {
+       …
+    }
+//将从库状态机置为REPL_STATE_TRANSFER
+    server.repl_state = REPL_STATE_TRANSFER;
+```
+
+当主服务器把RDB文件生成成功发送给从服务器的时候，会触发从服务器的socket的ae_readable事件，然后执行readSyncBulkPayload回调函数。
+
+readSyncBulkPayload函数清理从服务器的清理数据库，并且解析和载入RDB文件导入数据，最后再调用replicationCreateMasterClient方法，这个方法就把已连接的socket绑定到命令请求处理器（readQueryFromClient），用来监听后续的增量同步。
+
+### 总体流程
+
+![复制流程](https://gitee.com/JieMingLi/document-pics/raw/master/redis_replication.png)
+
+### 参考
+
+[redis复制源码解析](http://www.web-lovers.com/redis-source-replication.html)
+
+[redis复制状态机](https://learn.lianglianglee.com/%E4%B8%93%E6%A0%8F/Redis%20%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90%E4%B8%8E%E5%AE%9E%E6%88%98/21%20%20%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%EF%BC%9A%E5%9F%BA%E4%BA%8E%E7%8A%B6%E6%80%81%E6%9C%BA%E7%9A%84%E8%AE%BE%E8%AE%A1%E4%B8%8E%E5%AE%9E%E7%8E%B0.md)
+
 # 分布式锁
 
 1， setnx各类问题和解决思路
