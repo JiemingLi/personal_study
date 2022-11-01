@@ -1,5 +1,7 @@
 
 
+
+
 # AOF重写
 
  Redis 将生成新 AOF 文件替换旧 AOF 文件的功能命名为 “AOF 文件重写”，AOF 文件重写并不需要对现有的 AOF 文件进行任何读取、分析或者写入操作，这个功能是通过读取服务器当前的数据库状态来实现。
@@ -1130,6 +1132,313 @@ readSyncBulkPayload函数清理从服务器的清理数据库，并且解析和�
 [redis复制源码解析](http://www.web-lovers.com/redis-source-replication.html)
 
 [redis复制状态机](https://learn.lianglianglee.com/%E4%B8%93%E6%A0%8F/Redis%20%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90%E4%B8%8E%E5%AE%9E%E6%88%98/21%20%20%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%EF%BC%9A%E5%9F%BA%E4%BA%8E%E7%8A%B6%E6%80%81%E6%9C%BA%E7%9A%84%E8%AE%BE%E8%AE%A1%E4%B8%8E%E5%AE%9E%E7%8E%B0.md)
+
+## 哨兵执行流程
+
+**启动并初始化**Sentinel
+
+每个Sentinel会创建2个连向主服务器的网络连接
+
+1. 命令连接:用于向主服务器发送命令，并接收响应;
+2. 订阅连接:用于订阅主服务器的—sentinel—:hello频道。
+
+**获取主服务器信息**
+
+Sentinel默认每10s一次，向被监控的主服务器发送info命令，获取主服务器和其下属从服务器的信息。
+
+**获取从服务器信息**
+
+当Sentinel发现主服务器有新的从服务器出现时，Sentinel还会向**从服务器**建立命令连接和订阅连接。 
+
+在命令连接建立之后，Sentinel还是默认10s一次，向从服务器发送info命令，**并记录从服务器的信息。**
+
+**向主服务器和从服务器发送消息**(以订阅的方式)
+
+默认情况下，Sentinel每2s一次，向所有被监视的主服务器和从服务器所订阅的—sentinel—:hello频道
+
+上发送消息，消息中会携带Sentinel自身的信息和主服务器的信息。
+
+```c
+PUBLISH _sentinel_:hello "< s_ip > < s_port >< s_runid >< s_epoch > < m_name > <m_ip >< m_port ><m_epoch>"
+```
+
+**接收来自主服务器和从服务器的频道信息**
+
+当Sentinel与主服务器或者从服务器建立起订阅连接之后，Sentinel就会通过订阅连接，向服务器发送 以下命令:
+
+```c
+subscribe —sentinel—:hello
+```
+
+这也就是说，对于每个与 Sentinel 连接的服务器，Sentinel 既通过命今连接向服务器的_sentinel:hello频道发送信息，又通过订阅连接从服务器的 sentinel:hello
+频道接收消息。
+
+对于监视同一个服务器的多个 Sentinel来说，一个 Sentinel 发送的信息会被其他Sentinel 接收到，这些信息会被用于更新其他 Sentinel 对发送信息 Sentinel 的认知，也会被用于更新其他 Sentinel 对被监视服务器的认知（更新每个sentinel实例的sentinel字典）
+
+当 Sentinel 通过频道信息发现一个新的 Sentinel时，它不仅会为新 Sentinel 在 sentinels字典中创建相应的实例结构，还会创建一个连向新 Sentinel的命令连接，而新 Sentinel 也同样会创建连向这个Sentinel 的命令连接，最终监视同一主服务器的多个 Sentinel 将形成相互连接的网络：Sentinel A 有连向 Sentinel B的命令连接，而 Sentinel B也有连向Sentinel A 的命令连接。
+
+![image-20221102021907112](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221102021907112.png)
+
+创建命令连接的目的：
+
+1，实现主观下线检测和客观下线检测。
+
+2，sentinel选举出新的leader进行故障转移。
+
+**检测主观下线状态**
+
+Sentinel每秒一次向所有与它建立了命令连接的实例(主服务器、从服务器和其他Sentinel)发送PING命令
+
+1， 实例在down-after-milliseconds毫秒内返回无效回复(除了+PONG、-LOADING、-MASTERDOWN外)
+
+2， 实例在down-after-milliseconds毫秒内无回复(超时)
+
+Sentinel就会认为该实例主观下线(**SDown**)
+
+**检查客观下线状态**
+
+当一个Sentinel将一个主服务器判断为主观下线后，Sentinel会向同时监控这个主服务器的所有其他Sentinel发送查询命令（通过命令连接）
+
+```c
+SENTINEL is-master-down-by-addr <ip> <port> <current_epoch> <runid>
+```
+
+其他Sentinel回复
+
+```c
+<down_state>< leader_runid >< leader_epoch >
+```
+
+判断它们是否也认为主服务器下线。如果达到Sentinel配置中的**quorum**数量的Sentinel实例都判断主服 务器为主观下线，则该主服务器就会被判定为客观下线(**ODown**)。
+
+**选举** **Leader Sentinel**
+
+当一个主服务器被判定为客观下线后，监视这个主服务器的所有Sentinel会通过选举算法(raft)，**选出一个Leader Sentinel去执行failover(故障转移)操作。**
+
+**故障转移**
+
+当选举出Leader Sentinel后，Leader Sentinel会对下线的主服务器执行故障转移操作，主要有三个步骤:
+
+1. 它会将失效 Master 的其中一个 Slave 升级为新的 Master , 并让失效 Master 的其他 Slave 改为复 制新的 Master ;
+2. 当客户端试图连接失效的 Master 时，集群也会向客户端返回**新 Master 的地址**，使得集群可以使 用现在的 Master 替换失效 Master 。
+3. Master 和 Slave 服务器切换后， Master 的 redis.conf 、 Slave 的 redis.conf 和 sentinel.conf 的配置文件的内容都会发生相应的改变，即， Master 主服务器的 redis.conf配置文件中会多一行 replicaof 的配置， sentinel.conf 的监控目标会随之调换。
+
+**如何选择主服务器**
+
+哨兵leader根据以下规则从客观下线的主服务器的从服务器中选择出新的主服务器。
+
+1. 过滤掉主观下线的节点
+2. 选择slave-priority最高的节点，如果由则返回没有就继续选择
+3. 选择出复制偏移量最大的系节点，因为复制偏移量越大则数据复制的越完整，如果由就返回了，没有就继续
+4. 选择run_id最小的节点，因为run_id越小说明重启次数越少
+
+## 哨兵启动流程
+
+### 初始化
+
+哨兵实例是属于运行在一种特殊模式下的 Redis server，哨兵实例的初始化入口函数也是 main（在 server.c 文件中）。
+
+在main 函数在运行时，就会通过对运行参数的判断，来执行哨兵实例对应的运行逻辑。main函数中调用 **checkForSentinelMode 函数**，来判断当前运行的是否为哨兵实例
+
+```c
+server.sentinel_mode = checkForSentinelMode(argc,argv); // argc：启动命令字符串，argv：启动命令参数
+```
+
+checkForSentinelMode函数会根据以下两个条件判断当前是否运行了哨兵实例
+
+- 条件一：执行的命令本身，也就是 argv[0]，是否为“redis-sentinel”。
+- 条件二：执行的命令参数中，是否有“–sentinel”。
+
+```c
+int checkForSentinelMode(int argc, char **argv) {
+    int j
+    //第一个判断条件，判断执行命令本身是否为redis-sentinel
+    if (strstr(argv[0],"redis-sentinel") != NULL) return 1;
+    for (j = 1; j < argc; j++)
+        //第二个判断条件，判断命令参数是否有"--sentienl"
+        if (!strcmp(argv[j],"--sentinel")) return 1;
+    return 0;
+}
+```
+
+只要2个条件满足一个，server.sentinel_mode就会被设置为1，表明当前运行的是哨兵实例。在代码其他地方都会根据这值坐判断。
+
+### 初始化配置项
+
+哨兵实例运行时所用的配置项和 Redis 实例是有区别的，所以，main 函数会专门调用 initSentinelConfig 和 initSentinel 两个函数，来完成哨兵实例专门的配置项初始化
+
+```c
+if (server.sentinel_mode) {
+   initSentinelConfig();
+   initSentinel();
+}
+```
+
+**initSentinelConfig 函数**的作用
+
+1. 将当前 server 的端口号，改为哨兵实例专用的端口号（26379）
+2. 把 server 的 protected_mode 设置为 0，即允许外部连接哨兵实例，而不是只能通过 127.0.0.1 本地连接 server。
+3.  会初始化一个执行命令表，并保存在全局变量 server 的 commands 成员变量中。（这个命令表本身是一个哈希表，每个哈希项的键对应了一个命令的名称，而值对应了该命令实际的实现函数。）
+
+**initSentinel 函数**的作用
+
+1. initSentinel 函数会替换 server 能执行的命令表，哨兵实例是运行在特殊模式的 Redis server，它执行的命令和 Redis 实例也是有区别的，所以 initSentinel 函数会把 server.commands 对应的命令表清空
+
+```c
+  dictEmpty(server.commands,NULL);
+    for (j = 0; j < sizeof(sentinelcmds)/sizeof(sentinelcmds[0]); j++) {
+        …
+        struct redisCommand *cmd = sentinelcmds+j;
+        retval = dictAdd(server.commands, sdsnew(cmd->name), cmd);
+        …
+    }
+```
+
+哨兵实例执行的一些命令，其名称虽然和 Redis 实例命令表中的命令名称一样，但它们的实现函数是**针对哨兵实例专门实现的**。
+
+```c
+struct redisCommand sentinelcmds[] = {
+    {"ping",pingCommand,1,"",0,NULL,0,0,0,0,0},
+    {"sentinel",sentinelCommand,-2,"",0,NULL,0,0,0,0,0},
+    …
+    {"publish",sentinelPublishCommand,3,"",0,NULL,0,0,0,0,0},
+    {"info",sentinelInfoCommand,-1,"",0,NULL,0,0,0,0,0},
+    {"role",sentinelRoleCommand,1,"l",0,NULL,0,0,0,0,0},
+    …
+};
+```
+
+2.  initSentinel 函数在替换了命令表后，紧接着它会开始初始化哨兵实例用到的各种属性信息。
+
+   哨兵实例定义了 **sentinelState 结构体**，保存哨兵实例的 ID、用于故障切换的当前纪元、监听的主节点、正在执行的脚本数量，以及与其他哨兵实例发送的 IP 和端口号等信息
+
+   ```c
+   struct sentinelState {
+       char myid[CONFIG_RUN_ID_SIZE+1];  //哨兵实例ID
+       uint64_t current_epoch;         //当前纪元
+       dict *masters;      //监听的主节点的哈希表，比如，它会为监听的主节点创建一个哈希表，哈希项的键记录了主节点的名称，而值记录了对应的数据结构指针。
+       int tilt;           //是否处于TILT模式
+       int running_scripts;    //运行的脚本个数
+       mstime_t tilt_start_time;  //tilt模式的起始时间
+       mstime_t previous_time;     //上一次执行时间处理函数的时间
+       list *scripts_queue;         //用于保存脚本的队列
+       char *announce_ip;  //向其他哨兵实例发送的IP信息
+       int announce_port;  //向其他哨兵实例发送的端口号
+       …
+   } sentinel;
+   
+   
+   
+   ```
+
+   流程图如下所示
+
+   ![img](https://gitee.com/JieMingLi/document-pics/raw/master/6e692yy58da223d98b2d4d390c8e97ac-20221014000200-kbhzhzq.jpg)
+
+3. main 函数还会调用 initServer 函数完成 server 本身的初始化操作，这部分哨兵实例也是会执行的。然后，main 函数就会调用 **sentinelIsRunning 函数**（在 sentinel.c 文件中**）启动哨兵实例。**
+
+### 启动哨兵实例
+
+sentinelIsRunning函数执行的逻辑
+
+1. 确认哨兵实例的配置文件存在并且可以正常写入
+2. 它会检查哨兵实例是否设置了 ID。如果没有设置 ID 的话，sentinelIsRunning 函数就会为哨兵实例随机生成一个 ID。
+3. 调用 sentinelGenerateInitialMonitorEvents 函数给每个被监听的主节点发送事件信息
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/6a0241e822b02db8d907f7fdda48cebd-20221014000200-klz396c.jpg)
+
+#### 如何获取主节点
+
+在**initSentinel 函数**中，会初始化哨兵实例的数据结构 sentinel.masters（哈希表），sentinel.masters保存主节点。
+
+每个主节点会使用 **sentinelRedisInstance 结构**来保存，在sentinelRedisInstance 结构中，就包含了被监听主节点的地址信息。这个地址信息是由 sentienlAddr 结构体保存的，其中包括了节点的 IP 和端口号。
+
+```c
+typedef struct sentinelAddr {
+    char *ip;
+    int port;
+} sentinelAddr;
+```
+
+**sentinelRedisInstance 结构**还保存一些和主节点、故障切换相关的其他信息，比如主节点名称、ID、监听同一个主节点的其他哨兵实例、主节点的从节点、主节点主观下线和客观下线的时长
+
+```c
+typedef struct sentinelRedisInstance {
+    int flags;      //实例类型、状态的标记, flags 设置为 SRI_MASTER、SRI_SLAVE 或 SRI_SENTINEL 这三种宏定义（在 sentinel.c 文件中）时，就分别表示当前实例是主节点、从节点或其他哨兵。
+    char *name;     //实例名称
+    char *runid;    //实例ID
+    uint64_t config_epoch;  //配置的纪元
+    sentinelAddr *addr; //实例地址信息
+    ...
+    mstime_t s_down_since_time; //主观下线的时长
+    mstime_t o_down_since_time; //客观下线的时长
+    ...
+    dict *sentinels;    //监听同一个主节点的其他哨兵实例
+   dict *slaves;   //主节点的从节点
+   ...
+}
+```
+
+> sentinelRedisInstance 是一个通用的结构体，**它不仅可以表示主节点，也可以表示从节点或者其他的哨兵实例**。
+
+在执行sentinelIsRunning中如果需要获取主节点的信息，只需要从 sentinel.masters 结构中获取主节点对应的 sentinelRedisInstance 实例就可以。
+
+#### 发送消息
+
+获取到主节点后，就可以通过sentinelGenerateInitialMonitorEvents发送消息
+
+```c
+void sentinelGenerateInitialMonitorEvents(void) {
+    dictIterator *di;
+    dictEntry *de;
+
+    di = dictGetIterator(sentinel.masters);//获取masters的迭代器
+    while((de = dictNext(di)) != NULL) { //获取被监听的主节点
+        sentinelRedisInstance *ri = dictGetVal(de);
+        sentinelEvent(LL_WARNING,"+monitor",ri,"%@ quorum %d",ri->quorum);   //发送+monitor事件
+    }
+    dictReleaseIterator(di);
+}
+```
+
+通过调用 sentinelEvent 函数来实际发送事件信息，sentinelEvent如下
+
+```c
+//  level 表示当前的日志级别，type 表示发送事件信息所用的订阅频道，ri 表示对应交互的主节点，fmt 则表示发送的消息内容。
+void sentinelEvent(int level, char *type, sentinelRedisInstance *ri, const char *fmt, ...) 
+```
+
+sentinelEvent 函数会判断监听实例的类型是否为主节点。然后如果是主节点，sentinelEvent 函数会把监听实例的名称、IP 和端口号加入到待发送的消息中
+
+```c
+...
+//如果传递消息以"%"和"@"开头，就判断实例是否为主节点
+if (fmt[0] == '%' && fmt[1] == '@') {
+   //判断实例的flags标签是否为SRI_MASTER，如果是，就表明实例是主节点
+   sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ?
+                                         NULL : ri->master;
+   //如果当前实例是主节点，根据实例的名称、IP地址、端口号等信息调用snprintf生成传递的消息msg
+   if (master) {
+      snprintf(msg, sizeof(msg), "%s %s %s %d @ %s %s %d", sentinelRedisInstanceTypeStr(ri), ri->name, ri->addr->ip, ri->addr->port,
+                master->name, master->addr->ip, master->addr->port);
+  }
+        ...
+}
+...
+```
+
+生成完消息后，sentinelEvent 函数会调用 pubsubPublishMessage 函数（在 pubsub.c 文件中），将消息发送到对应的频道中。
+
+```c
+ if (level != LL_DEBUG) {
+        channel = createStringObject(type,strlen(type));
+        payload = createStringObject(msg,strlen(msg));
+        pubsubPublishMessage(channel,payload);
+        ...
+  }
+```
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/8f50ed685a3c66b34a2d1b2697b6e96a-20221014000200-vnsw674.jpg)
 
 # 分布式锁
 
