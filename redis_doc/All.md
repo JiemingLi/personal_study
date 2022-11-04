@@ -1544,8 +1544,9 @@ RedisCluster由多个Redis节点组构成，是一个P2P无中心节点的集群
 
 ![image-20221104231304424](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221104231304424.png)
 
-1. 集群中可以有多个单独的主节点，也可以有从节点。
-2. RedisCluster会在**每个节点**之间进行消息（ip 端口 状态 槽信息等）交换
+1. 集群中可以有多个单独的主节点，也可以有从节点，从节点也有状态，角色信息，工作重要是复制其主节点。
+2. RedisCluster会在**每个节点**之间进行消息（ip 端口 状态 处理槽的范围和复制哪个主节点的信息等）交换。
+3. 客户端和主节点连接，就是只会在主节点之间进行操作数据，所以也只有在主节点之间进行move和ask。
 
 **[Gossip协议](https://learn.lianglianglee.com/%E4%B8%93%E6%A0%8F/Redis%20%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90%E4%B8%8E%E5%AE%9E%E6%88%98/26%20%20%E4%BB%8EPing-Pong%E6%B6%88%E6%81%AF%E5%AD%A6%E4%B9%A0Gossip%E5%8D%8F%E8%AE%AE%E7%9A%84%E5%AE%9E%E7%8E%B0.md)**
 
@@ -1569,7 +1570,7 @@ redis-cluster把所有的物理节点映射到[0-16383]个**slot**上,基本上�
 
 ![image-20221105003831689](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221105003831689.png)
 
-> 当需要在 Redis 集群中放置一个 key-value 时，redis 先对 key 使用 crc16 算法算出一个结果，然后把 结果对 16384 求余数，这样每个 key 都会对应一个编号在 0-16383 之间的哈希槽，redis 会根据主节点 数量大致均等的将哈希槽映射到不同的主节点。
+> 当需要在 Redis 集群中放置一个 key-value 时，redis 先对 key 使用 crc16 算法算出一个结果，然后把 结果对 16384 求余数，这样每个 key 都会对应一个编号在 0-16383 之间的哈希槽，redis 会根据主节点 数量大致均等的将哈希槽映射到不同的主节点，从节点不参与计算。
 
 **优点**
 
