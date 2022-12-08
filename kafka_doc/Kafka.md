@@ -430,6 +430,85 @@ Kafka会在Zookeeper上针对每个Topic维护一个称为ISR(in-sync replica，
 
 ![image-20221204205133585](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221204205133585.png)
 
+## [控制器](https://jiamaoxiang.top/2020/07/06/Kafka%E7%9A%84Controller-Broker%E6%98%AF%E4%BB%80%E4%B9%88/)
+
+Kafka集群包含若干个broker，broker.id指定broker的编号，编号不要重复。
+
+控制器就是一个broker，需要负责一些额外的工作(追踪集群中的其他Broker，并在合适的时候处理新加入的和失败的Broker节点、Rebalance分区、分配新的leader分区等)。
+
+**Kafka集群中始终只有一个Controller Broker。**
+
+### 作用
+
+Controller Broker的主要职责有很多，主要是一些管理行为，主要包括以下几个方面：
+
+- 创建、删除主题，增加分区并分配leader分区
+- 集群Broker管理（新增 Broker、Broker 主动关闭、Broker 故障)
+- **preferred leader**选举
+- 分区重分配
+
+### 如何选举
+
+Broker 在启动时，会尝试去 ZooKeeper 中创建 /controller 节点。Kafka 当前选举控制器的规则是：**第一个成功创建 /controller 节点的 Broker 会被指定为控制器**。（利用zk临时节点的特性）
+
+>  即:Kafka通过Zookeeper的分布式锁特性选举**集群控制器**。
+
+### 处理broker下线的情况
+
+当某个Broker节点由于故障离开Kafka群集时，则存在于该Broker的leader分区将不可用(由于客户端仅对leader分区进行读写操作)。为了最大程度地减少停机时间，需要快速找到替代的leader分区。
+
+当控制器发现一个 broker 已经离开集群，那些失去Leader副本分区的Follower分区需要一个新 Leader(这些分区的首领刚好是在这个 broker 上)。
+
+1. 控制器需要知道哪个broker宕机了?
+   - 每个 Broker 启动后，会在zookeeper的 /Brokers/ids 下创建一个临时 znode。当 Broker 宕机或主动关闭后，该 Broker 与 ZooKeeper 的会话结束，这个 znode 会被自动删除。同理，ZooKeeper 的 Watch 机制将这一变更推送给控制器，这样控制器就能知道有 Broker 关闭或宕机了，控制器就知道哪些主题的leader分区宕机了，从而进行后续的协调操作。
+
+2. 控制器需要知道宕机的broker上负责的时候哪些分区的Leader副本分区?
+   - 每个 Broker 启动后，会在 zookeeper的 /Brokers/topics/具体的topic/partitions/分区号/state   下创建一个 znode，其可以看到某个主题的某个分区的情况，比如是否是leader，这个主题的isr是哪些等。
+
+**整个过程：**
+
+当某一台broker宕机后，控制器可以通过1知道是哪台服务器宕机，通过2知道宕机的有哪些主题的leader分区也宕机了，也知道其ISR列表，后续就决定哪些Broker上的分区成为leader分区，然后，它会通知每个相关的Broker，要么将Broker上的主题分区变成leader，要么通过`LeaderAndIsr`请求从新的leader分区中复制数据。
+
+### 处理broker加入的情况
+
+当Controller注意到Broker已加入集群时，它将使用Broker ID来检查该Broker上是否存在分区，如果存在，则Controller通知新加入的Broker和现有的Broker，新的Broker上面的follower分区再次开始复制现有leader分区的消息。为了保证负载均衡，Controller会将新加入的Broker上的follower分区选举为leader分区。
+
+> **注意**：上面提到的选Leader分区，严格意义上是换Leader分区，为了达到负载均衡，可能会造成原来正常的Leader分区被强行变为follower分区。换一次 Leader 代价是很高的，原本向 Leader分区A(原Leader分区) 发送请求的所有客户端都要切换成向 B (新的Leader分区)发送请求，建议你在生产环境中把这个参数设置成 false。
+
+### 脑裂
+
+如果controller Broker 挂掉了，Kafka集群必须找到可以替代的controller，集群将不能正常运转。这里面存在一个问题，很难确定Broker是挂掉了，还是仅仅只是短暂性的故障。但是，集群为了正常运转，必须选出新的controller。如果之前被取代的controller又正常了，他并不知道自己已经被取代了，那么此时集群中会出现两台controller。
+
+其实这种情况是很容易发生。比如，某个controller由于GC而被认为已经挂掉，并选择了一个新的controller。在GC的情况下，在最初的controller眼中，并没有改变任何东西，该Broker甚至不知道它已经暂停了。因此，它将继续充当当前controller，这是分布式系统中的常见情况，称为脑裂。
+
+假如，处于活跃状态的controller进入了长时间的GC暂停。它的ZooKeeper会话过期了，之前注册的`/controller`节点被删除。集群中其他Broker会收到zookeeper的这一通知。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/%E8%84%91%E8%A3%821.png)
+
+由于集群中必须存在一个controller Broker，所以现在每个Broker都试图尝试成为新的controller。假设Broker 2速度比较快，成为了最新的controller Broker。此时，每个Broker会收到Broker2成为新的controller的通知，由于Broker3正在进行”stop the world”的GC，可能不会收到Broker2成为最新的controller的通知。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/%E8%84%91%E8%A3%822.png)
+
+等到Broker3的GC完成之后，仍会认为自己是集群的controller，在Broker3的眼中好像什么都没有发生一样。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/%E8%84%91%E8%A3%823.png)
+
+现在，集群中出现了两个controller，它们可能一起发出具有冲突的命令，就会出现脑裂的现象。如果对这种情况不加以处理，可能会导致严重的不一致。所以需要一种方法来区分谁是集群当前最新的Controller。
+
+Kafka是通过使用**epoch number**（纪元编号，也称为隔离令牌）来完成的。epoch number只是单调递增的数字，第一次选出Controller时，epoch number值为1，如果再次选出新的Controller，则epoch number将为2，依次单调递增。
+
+每个新选出的controller通过Zookeeper 的条件递增操作获得一个全新的、数值更大的epoch number 。其他Broker 在知道当前epoch number 后，如果收到由controller发出的包含较旧(较小)epoch number的消息，就会忽略它们，即Broker根据最大的epoch number来区分当前最新的controller。
+
+![img](https://gitee.com/JieMingLi/document-pics/raw/master/%E8%84%91%E8%A3%824.png)
+
+上图，Broker3向Broker1发出命令:让Broker1上的某个分区副本成为leader，该消息的epoch number值为1。于此同时，Broker2也向Broker1发送了相同的命令，不同的是，该消息的epoch number值为2，此时Broker1只听从Broker2的命令(由于其epoch number较大)，会忽略Broker3的命令，从而避免脑裂的发生。
+
+### 结论
+
+1. Kafka使用 Zookeeper 的分布式锁选举控制器，并在节点加入集群或退出集群时通知控制器。
+2. 控制器负责在节点加入或离开集群时进行分区Leader选举。
+3. 控制器使用epoch来避免“脑裂”。“脑裂”是指两个节点同时认为自己是当前的控制器。
+
 # 物理存储
 
 Kafka 消息是以主题为单位进行归类，各个主题之间是彼此独立的，互不影响。
@@ -597,7 +676,488 @@ magic: 2 compresscodec: NONE crc: 3747213735
 
 如果要查找timstamp为1663899378988开始的消息，首先将时间戳和每个log文件中最大的时间戳largestTimeStamp进行逐一对比，直到找到不小于1663899378988所对应的segment。找到log文件后，使用二分法定位，找到不大于1663899378988的最大索引项，也就是[timestamp: 1663899378338 offset: 4031789]，拿着偏移量是4031789的offset值去偏移量索引文件找到不大于4031789的最大索引项，也就是[offset: 4031789 position: 16906]，之后从偏移量为16906的位置开始顺序查找，找到timestamp不小于1663899378988的消息。
 
-## 参考
+### 参考
 
 [kafka日志存储](https://www.cnblogs.com/kiko2014551511/p/16733479.html)
+
+## 日志清理
+
+Kafka 提供两种日志清理策略:
+
+- 日志删除:按照一定的删除策略，将不满足条件的数据进行数据删除
+
+- 日志压缩:针对每个消息的 Key 进行整合，对于有相同 Key 的不同 Value 值，只保留最后一个版本。
+
+> Kafka 提供 log.cleanup.policy 参数进行相应配置，默认值: delete ，还可以选择 compact 。
+
+### 删除
+
+**基于时间删除**：根据时间戳索引文件找到第一条比需要删除时间小的最大时间戳，索引到对应的日志。
+
+1. 从日志对象中所维护日志分段的跳跃表中移除待删除的日志分段，保证没有线程对这些日志分段进行读取操作（避免线程冲突）。
+2. 这些日志分段所有文件添加 上 .delete 后缀。
+3. 交由一个以 "delete-file" 命名的延迟任务来删除这些 .delete 为后缀的文件。延迟执行时间可以通过 file.delete.delay.ms 进行设置
+
+>   **如果活跃的日志分段中也存在需要删除的数据时?**
+>
+> *Kafka 会先切分出一个新的日志分段作为活跃日志分段，该日志分段不删除，删除原来的日志分 段。*
+
+**基于日志大小删除**：日志删除任务会检查当前日志的大小是否超过设定值。设定项为 log.retention.bytes ，单个日 志分段的大小由 log.segment.bytes 进行设定。
+
+1. 计算需要被删除的日志总大小
+2.  从日志文件第一个 LogSegment 开始查找可删除的日志分段的文件集合。
+3.  执行删除。
+
+**基于偏移量删除**：根据日志分段的**下一个**日志分段的起始偏移量是否大于等于日志文件的起始偏移量，若是，则可以删除此日志分段。
+
+![image-20221206165855555](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221206165855555.png)
+
+1. 从头开始遍历每个日志分段，日志分段1的下一个日志分段的起始偏移量为21，小于 logStartOffset，将日志分段1加入到**删除队列**中
+2. 日志分段 2 的下一个日志分段的起始偏移量为35，小于 logStartOffset，将 日志分段 2 加入 到删除队列中
+3. 日志分段 3 的下一个日志分段的起始偏移量为57，小于logStartOffset，将日志分段3加入删除 集合中
+4. 日志分段4的下一个日志分段的其实偏移量为71，大于logStartOffset，则不进行删除。
+
+### 压缩
+
+1. 对于具有相同的Key，而数据不同，只保留最后一条数据，前面的数据在合适的情况下删除。
+2. 日志压缩与key有关，确保每个消息的**key不为null**。
+
+**应用场景**
+
+在Spark、 Flink中做实时计算时，需要长期在内存里面维护一些数据，这些数据可能是通过聚合了一天或者一周的 日志得到的，这些数据一旦由于异常因素(内存、网络、磁盘等)崩溃了，从头开始计算需要很长的时 间。一个比较有效可行的方式就是定时将内存里的数据备份到外部存储介质中，当崩溃出现时，再从外 部存储介质中恢复并继续计算。
+
+*使用Kafka的压缩存储会有什么好处？*
+
+- Kafka即是数据源又是存储工具，可以简化技术栈，降低维护成本
+- 使用外部存储介质的话，需要将存储的Key记录下来，恢复的时候再使用这些Key将数据取 回，实现起来有一定的工程难度和复杂度。使用Kafka的日志压缩特性，只需要把数据写进 Kafka，等异常出现恢复任务时再读回到内存就可以了（可以对比redis和kafka的区别）
+- Kafka对于磁盘的读写做了大量的优化工作，比如磁盘顺序读写。相对于外部存储介质没有索 引查询等工作量的负担，可以实现高性能。同时，Kafka的日志压缩机制可以充分利用廉价的 磁盘，不用依赖昂贵的内存来处理，在性能相似的情况下，实现非常高的性价比(这个观点仅 仅针对于异常处理和容灾的场景来说)
+
+**过程**
+
+主题的 cleanup.policy 需要设置为compact。
+
+Kafka的后台线程会定时将Topic遍历2次
+
+-  记录每个key的hash值最后一次出现的偏移量
+-  第2次检查每个offset对应的Key是否在后面的日志中出现过，如果出现了就删除对应的日志。
+
+日志压缩允许删除，除最后一个key之外，删除先前出现的所有该key对应的记录（添加删除标识）。在一段时间后从日志中清理，以释放空间。**Kafka 提供了专门的后台线程定期地巡检待 Compact 的主题，看看是否存在满足条件的可删除数据**。
+
+
+
+压缩是在Kafka后台通过**定时重新打开**Segment来完成
+
+![image-20221206204419199](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221206204419199.png)
+
+虽然日志压缩，但可以依然可以保留一些特性
+
+- 消息始终保持顺序，压缩永远不会重新排序消息，只是删除一些而已
+- 消息的偏移量永远不会改变，它是日志中位置的永久标识符
+- 日志被删除后，日志可以保留Topic的log.cleaner.delete.retention.ms短的时间，默认是24小时，但是被压缩的一些日志会有delete标记。
+
+Kafka的日志压缩定时把所有的日志读取两遍，写一遍，而CPU的速度超过磁盘完全不是问题，只要日志的量对应的读取两遍和写入一遍的时间在可接受的范围内，那么它的性能就是 可以接受的。
+
+## 零拷贝，页缓存
+
+### DMA
+
+**在进行 I/O 设备和内存的数据传输的时候，数据搬运的工作全部交给 DMA 控制器，而 CPU 不再参与任何与数据搬运相关的事情，这样 CPU 就可以去处理别的事务**。
+
+![image-20221207131313934](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221207131313934.png)
+
+原本计算机所有组件之间的数据拷贝（流动）必须经过 CPU
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/c9e57c79d51c3bc86595dcec3ee097b4.png" alt="2.png" style="zoom:67%;" />
+
+现在，DMA 代替了 CPU 负责内存与磁盘以及内存与网卡之间的数据搬运，CPU 作为 DMA 的控制者，如下图所示：
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/f53083abb1b57ac58d9f10be511cd406.png" alt="3.png" style="zoom:67%;" />
+
+但是 DMA 有其局限性，DMA 仅仅能用于设备之间交换数据时进行数据拷贝，但是设备内部的数据拷贝还需要 CPU 进行。
+
+### 零拷贝
+
+**传统的数据传输方式**
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/%E4%BC%A0%E7%BB%9F%E6%96%87%E4%BB%B6%E4%BC%A0%E8%BE%93.png" alt="img" style="zoom:67%;" />
+
+期间共**发生了 4 次用户态与内核态的上下文切换**，因为发生了两次系统调用，一次是 `read()` ，一次是 `write()`，每次系统调用都得先从用户态切换到内核态，等内核完成任务后，再从内核态切换回用户态。
+
+> 上下文切换到成本并不小，一次切换需要耗时几十纳秒到几微秒，虽然时间看上去很短，但是在高并发的场景下，这类时间容易被累积和放大，从而影响系统的性能。
+
+**发生了 4 次数据拷贝**，其中两次是 DMA 的拷贝（如果没有DMA还需要cpu自己拷贝），另外两次则是通过 CPU 拷贝的
+
+- *第一次拷贝*，把磁盘上的数据拷贝到操作系统内核的缓冲区里，这个拷贝的过程是通过 DMA 搬运的。
+- *第二次拷贝*，把内核缓冲区的数据拷贝到用户的缓冲区里，于是我们应用程序就可以使用这部分数据了，这个拷贝到过程是由 CPU 完成的。
+- *第三次拷贝*，把刚才拷贝到用户的缓冲区里的数据，再拷贝到内核的 socket 的缓冲区里，这个过程依然还是由 CPU 搬运的。
+- *第四次拷贝*，把内核的 socket 缓冲区里的数据，拷贝到网卡的缓冲区里，这个过程又是由 DMA 搬运的。
+
+> 搬运一份数据，结果却搬运了 4 次，过多的数据拷贝无疑会消耗 CPU 资源，大大降低了系统性能,，简单的数据传输，没必要进行过多的拷贝。
+
+**为什么kafka使用0拷贝**
+
+由上可知，**想提高文件传输的性能，就需要减少「用户态与内核态的上下文切换」和「内存拷贝」的次数**。用户进程在数据传输过程中并不需要对数据进行访问和处理，没必要再把数据从内核空间（page cache）拷贝到用户空间（用户缓存），让数据在内核里面完成拷贝即可，而且数据最好是小文件（消息不会太大，所以更加适用于0拷贝）
+
+**0拷贝的2种实现方式**
+
+1. **mmap（减少内核空间到用户空间的数据拷贝） + write**
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/mmap.jpg" alt="mmap" style="zoom:67%;" />
+
+- 用户进程调用 `mmap()`，从用户态陷入内核态，将内核缓冲区映射到用户缓存区；
+
+- DMA 控制器将数据从硬盘拷贝到内核缓冲区（可见其使用了 Page Cache 机制）；
+- `mmap()` 返回，上下文从内核态切换回用户态；
+- 用户进程调用 `write()`，尝试把文件数据写到内核里的套接字缓冲区，再次陷入内核态；
+- CPU 将内核缓冲区中的数据拷贝到的套接字缓冲区；
+- DMA 控制器将数据从套接字缓冲区拷贝到网卡完成数据传输；
+- `write()` 返回，上下文从内核态切换回用户态。
+
+2. **sendFile**
+
+使用sendfile代替传统的read 和write系统调用，把2次系统调用改为1次，也就减少了 2 次上下文切换的开销。sendfile可以直接把内核缓冲区里的数据拷贝到 socket 缓冲区里，不再拷贝到用户态，这样就只有 2 次上下文切换，和 3 次数据拷贝。如下图：
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/senfile-3%E6%AC%A1%E6%8B%B7%E8%B4%9D.png" alt="img" style="zoom:67%;" />
+
+
+
+如果网卡支持 SG-DMA（*The Scatter-Gather Direct Memory Access*）技术（和普通的 DMA 有所不同），我们可以进一步减少通过 CPU 把内核缓冲区里的数据拷贝到 socket 缓冲区的过程（从 Linux 内核 `2.4` 版本开始起，对于支持网卡支持 SG-DMA 技术的情况下）
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/senfile-%E9%9B%B6%E6%8B%B7%E8%B4%9D.png" alt="img" style="zoom:67%;" />
+
+- 第一步，通过 DMA 将磁盘上的数据拷贝到内核缓冲区里；
+- 第二步，缓冲区描述符和数据长度传到 socket 缓冲区，这样网卡的 SG-DMA 控制器就可以直接将内核缓存中的数据拷贝到网卡的缓冲区里，此过程不需要将数据从操作系统内核缓冲区拷贝到 socket 缓冲区中，这样就减少了一次数据拷贝；
+
+> 零拷贝（*Zero-copy*）技术，因为我们没有在内存层面去拷贝数据，也就是说全程没有通过 CPU 来搬运数据，所有的数据都是通过 DMA 来进行传输的
+
+**0拷贝的优点：**
+
+相比传统文件传输的方式，减少了 2 次上下文切换和数据拷贝次数，只需要 2 次上下文切换和数据拷贝次数，就可以完成文件的传输，而且 2 次的数据拷贝过程，都不需要通过 CPU，2 次都是由 DMA 来搬运。
+
+**kafka的两个过程:**
+
+1. 网络数据持久化到磁盘 (Producer 到 Broker) （broker读取到producer得数据，使用mmap机制进行写操作，顺序写入磁盘。）
+2. 磁盘文件通过网络发送(Broker 到 Consumer)（sendfile的机制实现0拷贝，发送数据给consumer）
+
+> 数据落盘通常都是非实时的，Kafka的数据并不是实时的写入硬盘，它充分利用了现代操作系统分页存储（写入page cache）来利用内存提高I/O效率。
+
+**kafka最终通过Java NIO最终调用到sendfile**
+
+Kafka 文件传输的代码最终它调用了 Java NIO 库里的 `transferTo` 方法：
+
+```java
+@Overridepublic 
+long transferFrom(FileChannel fileChannel, long position, long count) throws IOException { 
+    return fileChannel.transferTo(position, count, socketChannel);
+}
+```
+
+如果 Linux 系统支持 `sendfile()` 系统调用，那么 `transferTo()` 实际上最后就会使用到 `sendfile()` 系统调用函数。
+
+**kafka可以使用0拷贝的前提：**
+
+- 系统支持sendfile（Linux 内核版本必须要 2.1 以上的版本）
+- 如果需要cpu完全不拷贝数据，则需要网卡支持 SG-DMA（Linux 内核版本必须要 2.4 以上的版本）
+
+### 页缓存和mmap
+
+##### **页缓存**
+
+**消息先被写入页缓存，由操作系统负责刷盘任务。**
+
+页缓存是操作系统实现的一种主要的磁盘缓存，以此用来减少对磁盘 I/O 的操作，把磁盘中的数据缓存到内存中，把对磁盘的访问变为对内存的访问。
+
+Kafka接收来自socket buffer的网络数据，应用进程不需要中间处理、直接进行持久化时。可以使用mmap内存文件映射。（相当于把read替换为mmap）
+
+**不适合读取大文件数据到page cahce**
+
+在传输大文件（GB 级别的文件）的时候，PageCache 会不起作用，那就白白浪费 DMA 多做的一次数据拷贝，造成性能的降低，即使使用了 PageCache 的零拷贝也会损失性能
+
+因为如果你有很多 GB 级别文件需要传输，每当用户访问这些大文件的时候，内核就会把它们载入 PageCache 中，于是 PageCache 空间很快被这些大文件占满。
+
+带来以下2个问题
+
+- PageCache 由于长时间被大文件占据，其他「热点」的小文件可能就无法充分使用到 PageCache，于是这样磁盘读写的性能就会下降了；
+- PageCache 中的大文件数据，由于没有享受到缓存带来的好处，但却耗费 DMA 多拷贝到 PageCache 一次；
+
+> 针对大文件的传输，不应该使用 PageCache，也就是说不应该使用零拷贝技术，因为可能由于 PageCache 被大文件占据，而导致「热点」小文件无法利用到 PageCache，这样在高并发的环境下，会带来严重的性能问题。
+
+**场景**
+
+读取大文件适合用异步IO + 直接IO（看下文）
+
+kafka传送消息不属于大文件范畴，所以适用于零拷贝
+
+[大文件合适使用的场景](https://xiaolincoding.com/os/8_network_system/zero_copy.html#%E5%A4%A7%E6%96%87%E4%BB%B6%E4%BC%A0%E8%BE%93%E7%94%A8%E4%BB%80%E4%B9%88%E6%96%B9%E5%BC%8F%E5%AE%9E%E7%8E%B0)
+
+##### **mmap**
+
+mmap：将磁盘文件映射到内存, 用户通过修改内存就能修改磁盘文件，直接利用操作系统的Page来实现磁盘文件到物理内存的直接映射。完成映射之后你 对物理内存的操作会被同步到硬盘上(操作系统在适当的时候)
+
+使用mmap的好处：通过mmap，进程像读写硬盘一样读写内存(当然是虚拟机内存)。使用这种方式可以获取很大的 I/O提升，**省去了用户空间到内核空间复制的开销**。
+
+使用mmap的缺点：:不可靠，写到mmap中的数据并没有被真正的写到硬盘，操作系统 会在程序主动调用flush的时候才把数据真正的写到硬盘。
+
+>  当使用mmap把数据从磁盘读取到page cache 的时候，用户进程读写数据的过程如下（可以类比mysql的写盘机制）
+
+当一个进程准备读取磁盘上的文件内容时：
+
+1. 操作系统会先查看待读取的数据所在的页 (page)是否在页缓存(pagecache)中，如果存在(命中) 则直接返回数据，从而避免了对物理磁盘的 I/O 操作;
+2. 如果没有命中，则操作系统会向磁盘发起读取请求并将读取的数据页存入页缓存，之后再将数 据返回给进程。
+
+当一个进程需要将数据写入磁盘:
+
+1. 操作系统也会检测数据对应的页是否在页缓存中，如果不存在，则会先在页缓存中添加相应的 页，最后将数据写入对应的页。
+2. 被修改过后的页也就变成了脏页，操作系统会在合适的时间把脏页中的数据写入磁盘，以保持 数据的一致性。
+
+*Kafka中大量使用了页缓存，这是 Kafka 实现高吞吐的重要因素之一。*
+
+##### 直接IO
+
+[看参考3.4](https://spongecaptain.cool/SimpleClearFileIO/2.%20DMA%20%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D%E6%8A%80%E6%9C%AF.html)
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/directIO.jpg" alt="directIO" style="zoom:67%;" />
+
+### 参考
+
+[深入理解零拷贝技术](http://dockone.io/article/2434459)
+
+[mmap代码了解](https://github.com/Spongecaptain/SimpleClearFileIO/issues/1)
+
+[什么是0拷贝-小林](https://xiaolincoding.com/os/8_network_system/zero_copy.html)
+
+[mmap基本概念](https://spongecaptain.cool/SimpleClearFileIO/3.%20mmap.html)
+
+[DMA和0拷贝技术](https://spongecaptain.cool/SimpleClearFileIO/2.%20DMA%20%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D%E6%8A%80%E6%9C%AF.html)
+
+## 顺序读写
+
+操作系统可以针对线性读写做深层次的优化（空间局部性），比如预读(read-ahead，提前将一个比较大的磁盘块读入内存，定位到偏移量之后，后续的也可以很快读取到了，减少后续有随机读写的概率) 和后写(write-behind，将很多小的逻辑写操作合并起来组成一个大的物理写操作，顺序写，避免随机磁盘io，也保障读取的时候可以顺序读)技术。
+
+<img src="https://gitee.com/JieMingLi/document-pics/raw/master/image-20221207133253867.png" alt="image-20221207133253867" style="zoom:67%;" />
+
+Kafka 在设计时采用了**文件追加**的方式来写入消息，即只能在日志文件的尾部追加新的消息，**并且也不允许修改已写入的消息**（压缩或者删除），这种方式属于典型的顺序写盘的操作，所以就算 Kafka 使用磁盘作为存储介质，也能承载非常大的吞吐量。
+
+> 硬盘是机械结构，每次读写都会寻址->写入，其中寻址是一个“机械动作”，它是最耗时的。所以硬盘最讨厌随机I/O，最喜欢顺序I/O。为了提高读写硬盘的速度，Kafka就是使用顺序I/O。这样省去了大量的内存开销以及节省了IO寻址的时间。
+
+## kafka处理速度快的原因
+
+1. partition顺序读写，充分利用磁盘特性，这是基础;
+2. Producer生产的数据持久化到broker，采用mmap文件映射，实现顺序的快速写入;
+3. Customer从broker读取数据，采用sendfile，将磁盘文件读到OS内核缓冲区后，直接转到socket buffer进行网络发送。
+
+# 可靠性保证
+
+副本因子，副本节点，ISR，OSR，副本的分配
+
+![image-20221207221058374](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221207221058374.png)
+
+# 一致性保证
+
+HW， Leo， Remote Leo，Leader epoch 
+
+[高水位，leader epoch](https://www.cnblogs.com/huxi2b/p/7453543.html)
+
+[高水位](https://learn.lianglianglee.com/%E4%B8%93%E6%A0%8F/Kafka%E6%A0%B8%E5%BF%83%E6%8A%80%E6%9C%AF%E4%B8%8E%E5%AE%9E%E6%88%98/27%20%20%E5%85%B3%E4%BA%8E%E9%AB%98%E6%B0%B4%E4%BD%8D%E5%92%8CLeader%20Epoch%E7%9A%84%E8%AE%A8%E8%AE%BA.md)
+
+# 消息重复的场景和解决方案
+
+发生重试的场景
+
+1. 生产者阶段 
+2. broke阶段 
+3. 消费者阶段
+
+## 生产者重复发送
+
+生产发送的消息没有收到正确的broke响应，导致生产者重试；生产者发出一条消息，broke落盘以后因为网络等种种原因发送端得到一个发送失败的响应或者网络中断，然后生产者收到一个可恢复的Exception重试消息导致消息重复。
+
+**过程**
+
+![image-20221208153527228](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221208153527228.png)
+
+1. new KafkaProducer()后创建一个后台线程KafkaThread扫描RecordAccumulator中是否有消 息;
+2. 调用KafkaProducer.send()发送消息，实际上只是把消息保存到RecordAccumulator中;
+3. 后台线程KafkaThread扫描到RecordAccumulator中有消息后，将消息发送到kafka集群;
+4. 如果发送成功，那么返回成功;
+5. 如果发送失败，那么判断是否允许重试。如果不允许重试，那么返回失败的结果;如果允许重试，把消息再保存到RecordAccumulator中，等待后台线程KafkaThread扫描再次发送;
+
+### 解决方案
+
+要启动kafka的幂等性，设置: enable.idempotence=true ，以及 ack=all 以及 retries > 1 。
+
+## 生产者丢失数据的场景
+
+**ack = 0，不重试**
+
+生产者发送消息完，不管结果了，如果发送失败也就丢失了。
+
+**Ack = 1 （只有leader收到才返回），leader 崩溃**
+
+生产者发送消息完，只等待Leader写入成功就返回了，Leader分区丢失了，此时Follower没来及同步，消息丢失。
+
+**unclean.leader.election.enable = true**
+
+允许选举ISR以外的副本作为leader,会导致数据丢失，默认为false。生产者发送异步消息，只等待Lead写入成功就返回，Leader分区丢失，此时ISR中没有Follower，Leader从OSR中选举，因为OSR中本来落后于Leader造成消息丢失。
+
+### 解决方案
+
+**禁用unclean选举，并且ack=all**
+
+1， *ack=all / -1,tries > 1*
+
+生产者发完消息，等待Follower同步完再返回，如果异常则重试。副本的数量可能影响吞吐量，不超过5个，一般三个。
+
+2， *unclean.leader.election.enable : false*
+
+不允许unclean Leader选举。
+
+**配置:min.insync.replicas > 1**
+
+当生产者将 acks 设置为 all (或 -1 )时， min.insync.replicas>1 。指定确认消息写成功需要的最小副本数量。达不到这个最小值，生产者将引发一个异常(要么是NotEnoughReplicas，要么是NotEnoughReplicasAfterAppend)。
+
+> 当一起使用时， min.insync.replicas 和 ack 允许执行更大的持久性保证。一个典型的场景是创建一个复制因子为3的主题，设置min.insync复制到2个，用 all 配置发送。将确保如果大多数副本没有收到写操作，则生产者将引发异常。
+
+**失败的offset单独记录**
+
+生产者发送消息，会自动重试，遇到不可恢复异常会抛出，这时可以捕获异常记录到数据库或缓存，进行单独处理。
+
+## 生产者发送的顺序
+
+如果设置 `max.in.flight.requests.per.connection` 大于1(默认5，单个连接上发送的未确认 请求的最大数量，表示上一个发出的请求没有确认下一个请求又发出了)。大于1可能会改变记录的顺 序，因为如果将两个batch发送到单个分区，第一个batch处理失败并重试，但是第二个batch处理成 功，那么第二个batch处理中的记录可能先出现被消费。
+
+设置 `max.in.flight.requests.per.connection` 为1，可能会影响吞吐量，可以解决**单个生产者**发送顺序问题，多个生产者的顺序还是无法保证，比如如果多个生产者，生产者1先发送一个请求，生产者2后发送请求，此时生产者1返回可 恢复异常，重试一定次数成功了。虽然生产者1先发送消息，但生产者2发送的消息会被先消费。
+
+## 消费者重复消费
+
+**原因**
+
+数据消费完没有及时提交offset到broker。
+
+**场景**
+
+消息消费端在消费过程中挂掉没有及时提交offset到broke，另一个消费端启动拿之前记录的offset开始消费，由于offset的滞后性可能会导致新启动的客户端有少量重复消费。
+
+### 解决方案
+
+**取消自动提交**
+
+每次消费完或者程序退出时手动提交。这可能也没法保证一条重复。
+
+**下游做幂等**
+
+一般是让下游做幂等或者尽量每消费一条消息都记录offset
+
+1， 对于少数严格的场景可能需要把offset 或唯一ID(例如订单ID)和下游状态更新放在同一个数据库里面做事务来保证精确的一次更新
+
+2， 在下游数据表里面同时记录消费offset，然后更新下游数据的时候用消费位移做乐观锁拒绝旧位移的数据更新。
+
+# consumer_offset
+
+[参考](https://learn.lianglianglee.com/%E4%B8%93%E6%A0%8F/Kafka%E6%A0%B8%E5%BF%83%E6%8A%80%E6%9C%AF%E4%B8%8E%E5%AE%9E%E6%88%98/16%20%20%E6%8F%AD%E5%BC%80%E7%A5%9E%E7%A7%98%E7%9A%84%E2%80%9C%E4%BD%8D%E7%A7%BB%E4%B8%BB%E9%A2%98%E2%80%9D%E9%9D%A2%E7%BA%B1.md)
+
+Zookeeper不适合大批量的频繁写入操作（为什么zk不适合频繁写操作？）
+
+Kafka 1.0.2将consumer的位移信息保存在Kafka内部的topic中，即__consumer_offsets主题，并且默认提供了kafka_consumer_groups.sh脚本供用户查看consumer信息。
+
+**当 Kafka 集群中的第一个 Consumer 程序启动时，Kafka 会自动创建位移主题**。
+
+Broker 端参数 offsets.topic.num.partitions 的取值了。它的默认值是 50，因此 Kafka 会自动创建一个 50 分区的位移主题。
+
+当消费者进行消费消息提交位移时，会像一个生产者一样，把消费到的位移发送给broker的comsumer_offset主题（这个消息的格式有key值，key：<groupId：topic：消费到的分区号>，value是位移值）因为comsumer_offset默认有50个分区，所以需要确认这个消费者组的位移消息发送到哪个comsumer_offset的哪个分区，这个分区的计算规则就是：`Math.abs(groupId.hashCode()) % 50` ，假如计算出来的值是15，则要把这个消费者组的所有的位移信息发送到comsumer_offset的15号分区，找到15号分区的leader副本，包含这个leader副本的broker就是这个主题的**协调者**（可以关联到消费者组的管理），后续向其传输位移数据。
+
+问题：自动提交和手动提交的详解
+
+# 延时队列
+
+备注：需要了解延时队列在业务场景的使用。
+
+场景：火车订单30s内未支付，则自动取消订单，https://juejin.cn/post/7065664161786626084
+
+延时队列的其他实现：RocketMQ，Redis，XXX-JOB，JUC的代码
+
+## **背景**
+
+两个follower副本都已经拉取到了leader副本的最新位置，此时又向leader副本发送拉取请求，而 leader副本并没有新的消息写入，那么此时leader副本该如何处理呢?可以直接返回空的拉取结果给 follower副本，不过在leader副本一直没有新消息写入的情况下，follower副本会一直发送拉取请求，并 且总收到空的拉取结果，消耗资源。
+
+## 拉取消息延时
+
+Kafka在处理拉取请求时，会先读取一次日志文件，如果收集不到足够多(fetchMinBytes，由参数 `fetch.min.bytes`配置，默认值为1)的消息，那么就会创建一个延时拉取操作(DelayedFetch)以等待 拉取到足够数量的消息。当延时拉取操作执行时，会再读取一次日志文件，然后将拉取结果返回给 follower副本。
+
+> 在Kafka中有多种延时操作，比如延时数据删除、延时生产等。
+
+## 延时生产
+
+如果在使用生产者客户端发送消息的时候将acks参数设置为-1，那么 就意味着需要等待ISR集合中的所有副本都确认收到消息之后才能正确地收到响应的结果，或者捕获超时异常。
+
+![image-20221208182430378](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221208182430378.png)
+
+由于客户端设置了acks为-1，那么需要等到follower1和follower2两个副本都收到消息3和消息4后 才能告知客户端正确地接收了所发送的消息。如果在一定的时间内，follower1副本或follower2副本没 能够完全拉取到消息3和消息4，那么就需要返回超时异常给客户端。生产请求的超时时间由参数 request.timeout.ms配置，默认值为30000，即30s。
+
+![image-20221208182520234](https://gitee.com/JieMingLi/document-pics/raw/master/image-20221208182520234.png)
+
+**这里等待消息3和消息4写入follower1副本和follower2副本，并返回相应的响应结果给客户端 的动作是由谁来执行？**
+
+在将消息写入leader副本的本地日志文件之后，Kafka会创建一个延时的生产操作(DelayedProduce)
+
+延时操作：*用来处理消息正常写入所有副本或超时的情况，以返回相应的响应结果给客户端。*
+
+延时操作需要延时返回响应的结果，首先它必须有一个**超时时间**(delayMs)，
+
+1， 如果在这个超时时间内没有完成既定的任务，那么就需要强制完成以返回响应结果给客户端。
+
+2， 延时操作不同于定时操作，定时操作是指在特定时间之后执行的操作，而延时操作可以在所设定的超时时间之前完成，所以延时操作能够**支持外部事件的触发**。
+
+**什么是外部事件？**
+
+外部事件就是所要写入消息的某个分区的HW(高水位)发生增长。也就 是说，随着follower副本不断地与leader副本进行消息同步，进而促使HW进一步增长，HW每增长一次 都会检测是否能够完成此次延时生产操作，如果可以就执行以此返回响应结果给客户端;如果在超时时 间内始终无法完成，则强制执行。
+
+## 延时拉取
+
+延时拉取操作是由**超时触发**或外部事件触发而被执行。
+
+**超时触发**
+
+就是等到超时时间 之后触发第二次读取日志文件的操作。
+
+**外部事件**
+
+拉取请求不单单由follower 副本发起，也可以由消费者客户端发起，两种情况所对应的外部事件也是不同的。
+
+1. 如果是follower副本的延时拉取，它的外部事件就是消息追加到了leader副本的本地日志文件中。
+2. 如果是消费者客户端的延时拉取，它的外部事件可以简单地理解为HW的增长。
+
+## 参考
+
+https://www.cnblogs.com/fanchengmeng/p/16362441.html
+
+[kafka实现延时队列](https://it-blog-cn.com/blogs/qmq/queue.html)
+
+## 实现
+
+[时间轮算法]((https://juejin.cn/post/6844904110399946766))
+
+> 简单了解即可，太过于复杂。
+
+
+
+# 重试队列和死信队列
+
+死信可以看作消费者不能处理收到的消息，也可以看作消费者不想处理收到的消息，还可以看作不符合处理要求的消息。比如消息内包含的消息内容无法被消费者解析，为了确保消息的可靠性而不被随意丢弃，故将其投递到死信队列中，这里的死信就可以看作消费者不能处理的消息。再比如超过既定的重试次数之后将消息投入死信队列，这里就可以将死信看作不符合处理要求的消息。
+
+进入死信队列可以由人工进行处理
+
+如果消费者消费多次后都失败（期间也可以进行延迟），满足一定的阈值之后，再放入死信队列进行人工处理。
+
+## 实现
+
+kafka没有重试机制不支持消息重试，也没有死信队列，因此使用kafka做消息队列时，需要自己实现消息重试的功能。
+
+创建新的kafka主题作为重试队列:
+
+1. 创建一个topic作为重试topic，用于接收等待重试的消息。
+2. 在消费者消费消息失败的时候，把需要重试的消息发送给重试topic。
+3. 从重试topic获取待重试消息储存到redis的zset中，并以下一次消费时间排序 （redis的zset使用的场景）
+4. 定时任务（spring的@Scheduled）从redis获取到达消费事件的消息，并把消息发送到对应的topic，进行再次消费。
+5. 同一个消息重试次数过多则不再重试（第1次10s，第2次30s等），重试次数过多则放入死信队列。
 
